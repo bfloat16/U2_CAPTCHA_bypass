@@ -11,11 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common import request_get_binary, request_get_text, retry
 
 
-def fetch_image(url, title):
+def fetch_image(url):
     """Download image from URL and return title with decoded image."""
     img = request_get_binary(url)
     image = Image.open(BytesIO(img)).convert("RGB")
-    return title, image
+    return image
 
 
 @retry
@@ -46,13 +46,12 @@ def fetch_anime_images(anime_url):
     if not a_tags:
         raise Exception("No images found at " + anime_url)
     for a_tag in a_tags:
-        title = a_tag.get("title")
         img_tag = a_tag.find("img")
         if not img_tag:
             raise Exception("Image tag not found in one of the results")
         img_url = img_tag.get("data-src")
-        if img_url and (img_url, title) not in image_urls:
-            image_urls.append((img_url, title))
+        if img_url not in image_urls:
+            image_urls.append((img_url))
     return image_urls
 
 @retry
@@ -74,16 +73,20 @@ def get_verification_info():
     # Clean up the submit input values (questions)
     submit_inputs = soup.find_all("input", {"type": "submit"})
     submit_values = [inp.get("value") for inp in submit_inputs]
-    clean_values = [value.split(" / ")[0].replace(r".hack//", "") for value in submit_values]
+    clean_values = [f"{i + 1}_+_{value.split(' / ')[0].replace('.hack//', '')}" for i, value in enumerate(submit_values)]
+    submit_values = [f"{i + 1}_+_{value}" for i, value in enumerate(submit_values)]
     
-    print("Verification image src:", img_src)
+    print("Verification image src:")
+    print(img_src, "\n")
     print("Verification submit values:")
     for value in submit_values:
         print(value)
+    print("\n")
     print("Verification clean values:")
     for value in clean_values:
         print(value)
-    return img_src, clean_values
+    print("\n")
+    return img_src, clean_values, submit_values
 
 def process_detection_results(results, image):
     """
@@ -140,42 +143,52 @@ def process_detection_results(results, image):
 ##############################################
 def main():
     # 1. Get the verification CAPTCHA image and question values
-    verification_img_src, verification_questions = get_verification_info()
+    verification_img_src, verification_questions, submit_values = get_verification_info()
 
     # 2. Use multithreading to get anime image URLs from MAL based on verification questions
     anime_images_url = []
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_anime_images_url, anime): anime for anime in verification_questions}
+        futures = {}
+        for anime in verification_questions:
+            index, anime_name = anime.split("_+_")
+            future = executor.submit(fetch_anime_images_url, anime_name)
+            futures[future] = index
+
         for future in as_completed(futures):
-            try:
-                anime_url = future.result()
-                anime_images_url.append(anime_url)
-            except Exception as e:
-                print("Error fetching MAL URL:", e)
+            index = futures[future]
+            anime_url = future.result()
+            anime_images_url.append((index, anime_url))
+
     print("Fetched MAL anime image URLs successfully.")
 
     # 3. Fetch anime images (links + titles) from the URLs concurrently
     anime_images = []
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_anime_images, url): url for url in anime_images_url}
+        futures = {}
+        for index, url in anime_images_url:
+            future = executor.submit(fetch_anime_images, url)
+            futures[future] = index
+
         for future in as_completed(futures):
-            try:
-                anime_images.extend(future.result())
-            except Exception as e:
-                print("Error fetching anime images:", e)
+            index = futures[future]
+            image_data = future.result()
+            anime_images.extend([(index, img_url) for img_url in image_data])
+
     print("Fetched anime image links successfully.")
 
     # 4. Download and decode each anime image concurrently
     result_images = []
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_image, img_url, title): (img_url, title) for img_url, title in anime_images}
+        futures = {}
+        
+        for index, img_url in anime_images:
+            future = executor.submit(fetch_image, img_url)
+            futures[future] = index
+
         for future in as_completed(futures):
-            try:
-                title, image = future.result()
-                if image is not None:
-                    result_images.append((title, image))
-            except Exception as e:
-                print("Error downloading image:", e)
+            index = futures[future]
+            image = future.result()
+            result_images.append((index, image))
     print("Downloaded all anime images successfully.")
 
     # 5. Load the pre-trained YOLO model and run detection on the verification image
@@ -213,17 +226,29 @@ def main():
 
     # 7. Compute cosine similarity between the verification region and each downloaded anime image
     cos = torch.nn.CosineSimilarity(dim=0)
-    similarities = []
-    for title, image in result_images:
+
+    max_sim_by_index = {}
+
+    for index, image in result_images:
         features = extract_features(image)
         sim = cos(features[0], yolo_features[0]).item()
-        # Normalize cosine similarity from [-1,1] to [0,1]
-        sim = (sim + 1) / 2
-        similarities.append((title, sim))
+        sim = (sim + 1) / 2  
 
-    similarities.sort(key=lambda x: x[1], reverse=True)
-    for title, sim in similarities:
-        print(f"{title}: {sim}")
+        if index not in max_sim_by_index or sim > max_sim_by_index[index]:
+            max_sim_by_index[index] = sim
+
+
+    sorted_indexs = sorted(max_sim_by_index.items(), key=lambda x: x[1], reverse=True)
+    index_mapping = {index: anime for submit_value in submit_values for index, anime in [submit_value.split("_+_")]}
+
+    if not sorted_indexs or sorted_indexs[0][1] < 0.90:
+        print("⚠️ Warning: Maximum similarity is below 90%, results may be unreliable.")
+
+    print("\n\n=====================================================")
+
+    for index, sim in sorted_indexs:
+        anime_name = index_mapping.get(index, index)
+        print(f"{sim*100:.2f}% {anime_name}")
 
 if __name__ == "__main__":
     main()
