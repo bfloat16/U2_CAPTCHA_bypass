@@ -1,6 +1,5 @@
 import re
 import json
-import requests
 from bs4 import BeautifulSoup
 
 from common import request_get_text
