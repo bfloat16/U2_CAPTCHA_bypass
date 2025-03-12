@@ -1,0 +1,1 @@
+<img src="U2_CAPTCHA_detection_0.jpg" width="1000px">
